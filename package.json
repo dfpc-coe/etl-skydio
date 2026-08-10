@@ -1,9 +1,9 @@
 {
-    "name": "coe-etl-template",
+    "name": "etl-skydio",
     "type": "module",
-    "prviate": true,
+    "private": true,
     "version": "1.0.0",
-    "description": "",
+    "description": "Skydio Cloud drone telemetry tracking for CloudTAK",
     "main": "task.ts",
     "scripts": {
         "lint": "eslint *.ts",
@@ -14,6 +14,7 @@
     "license": "ISC",
     "devDependencies": {
         "@eslint/js": "^10.0.0",
+        "@openaddresses/batch-schema": "^10.27.0",
         "eslint": "^10.0.0",
         "typescript": "^6.0.0",
         "typescript-eslint": "^8.0.0"
