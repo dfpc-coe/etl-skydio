@@ -10,6 +10,11 @@
 
 ## Version History
 
+### v1.1.0
+
+- :rocket: Add Capabilities document
+- :arrow_up: Update GH Actions
+
 ### v1.0.0
 
 - :tada: Live Telemetry websocket streaming => position CoTs for in-flight vehicles (Schedule invocation)

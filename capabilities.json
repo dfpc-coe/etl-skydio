@@ -1,0 +1,38 @@
+{
+    "version": "1.0",
+    "name": "Skydio",
+    "description": "Streams live Skydio Cloud drone telemetry into TAK as Cursor-on-Target and receives Skydio webhook events for flight state, device alerts, and live stream status.",
+    "compute": {
+        "memory": 1024,
+        "timeout": 120
+    },
+    "permissions": [
+        {
+            "resource": "feature:*",
+            "required": true,
+            "description": "Skydio posts live drone positions to the map"
+        },
+        {
+            "resource": "event:*",
+            "required": true,
+            "description": "Posts Skydio device and flight state alerts to the map"
+        }
+    ],
+    "invocations": {
+        "incoming": {
+            "schedule": {
+                "description": "Polls Skydio Cloud for updated drone telemetry on a schedule.",
+                "default": {
+                    "enabled": true,
+                    "schedule": "rate(1 minute)"
+                }
+            },
+            "webhook": {
+                "description": "Receives Skydio webhook events for flight state, device alerts, and live stream status.",
+                "default": {
+                    "enabled": true
+                }
+            }
+        }
+    }
+}
