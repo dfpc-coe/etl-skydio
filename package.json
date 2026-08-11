@@ -2,7 +2,7 @@
     "name": "etl-skydio",
     "type": "module",
     "private": true,
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Skydio Cloud drone telemetry tracking for CloudTAK",
     "main": "task.ts",
     "scripts": {
