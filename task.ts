@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import https from 'node:https';
 import type { Static, TSchema } from '@sinclair/typebox';
 import { Type } from '@sinclair/typebox';
 import type { Event } from '@tak-ps/etl';
@@ -184,6 +185,48 @@ const TelemetryAvailableResource = Type.Object({
  */
 function enuToCompass(yaw: number): number {
     return ((90 - (yaw * 180 / Math.PI)) % 360 + 360) % 360;
+}
+
+/**
+ * Replay a websocket handshake over plain HTTPS to recover the status code and body
+ * of a rejected upgrade - Skydio explains stream authorization failures in the body
+ * (ie `API Token was not valid for requested data streams: [data/SkydioX10-xxxx]`)
+ * but the WHATWG WebSocket client throws all of that away on a non-101 response
+ */
+function handshake(url: URL): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const req = https.request({
+            hostname: url.hostname,
+            port: url.port || 443,
+            path: url.pathname + url.search,
+            method: 'GET',
+            headers: {
+                'Connection': 'Upgrade',
+                'Upgrade': 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64')
+            }
+        });
+
+        req.setTimeout(10000, () => {
+            req.destroy(new Error('Handshake timed out'));
+        });
+
+        req.on('upgrade', (_res, socket) => {
+            socket.destroy();
+            resolve('handshake succeeded (101) but the stream closed immediately');
+        });
+
+        req.on('response', (res) => {
+            let body = '';
+            res.on('data', (chunk) => body += String(chunk));
+            res.on('end', () => resolve(`${res.statusCode} ${body.trim()}`));
+        });
+
+        req.on('error', reject);
+
+        req.end();
+    });
 }
 
 function statusToFeature(
@@ -455,7 +498,35 @@ export default class Task extends ETL {
 
             let interval: ReturnType<typeof setInterval> | undefined = undefined;
             let deadline: ReturnType<typeof setTimeout> | undefined = undefined;
+            let diagnosing: Promise<void> | undefined = undefined;
+            let opened = false;
             let done = false;
+
+            /**
+             * The WHATWG WebSocket in Node discards the handshake response on a non-101
+             * status, so a rejected upgrade surfaces as an empty ErrorEvent and a 1006
+             * close - replay the handshake over plain HTTPS to recover the status code
+             * and body Skydio actually returned
+             */
+            const diagnose = (): Promise<void> => {
+                if (!diagnosing) {
+                    diagnosing = handshake(url)
+                        .then((res) => {
+                            console.error(`not ok - live telemetry websocket failed: ${res}`);
+
+                            // Every documented auth form produces the same 401, so this is never
+                            // something the request shape can fix - it is the token or the region
+                            if (res.startsWith('401')) {
+                                console.error('not ok - check that the API Token has read-only access to Live Telemetry (Settings > API Tokens - scopes are fixed at creation, so this needs a new token), that Live Telemetry is enabled (Settings > Live Streaming > Live APIs), and that SKYDIO_STREAM_URL matches the region shown under Settings > Devices > Vehicles > Connectivity');
+                            }
+                        })
+                        .catch((err) => {
+                            console.error('not ok - live telemetry websocket failed', err instanceof Error ? err.message : err);
+                        });
+                }
+
+                return diagnosing;
+            };
 
             const finish = (): void => {
                 if (done) return;
@@ -470,13 +541,19 @@ export default class Task extends ETL {
                     console.error(err);
                 }
 
-                resolve();
+                // Never opened - report why before giving the stream budget back
+                if (!opened) {
+                    diagnose().finally(resolve);
+                } else {
+                    resolve();
+                }
             };
 
             deadline = setTimeout(finish, duration);
             interval = setInterval(flush, env.SUBMIT_INTERVAL * 1000);
 
             ws.addEventListener('open', () => {
+                opened = true;
                 console.log('ok - live telemetry websocket connected');
             });
 
@@ -494,13 +571,18 @@ export default class Task extends ETL {
                 }
             });
 
-            ws.addEventListener('error', (err) => {
-                console.error('not ok - live telemetry websocket error', err);
+            ws.addEventListener('error', () => {
+                // Closing down normally races an error/close pair - nothing left to report
+                if (done) return;
+
+                if (opened) console.error('not ok - live telemetry websocket error');
+
                 finish();
             });
 
             ws.addEventListener('close', (ev) => {
-                console.log(`ok - live telemetry websocket closed: ${ev.code} ${ev.reason}`);
+                if (opened) console.log(`ok - live telemetry websocket closed: ${ev.code} ${ev.reason}`);
+
                 finish();
             });
         });
