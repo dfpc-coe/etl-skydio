@@ -38,7 +38,9 @@ Incoming webhook requests are authenticated by validating the `Skydio-Verificati
 | ----- | ----------- |
 | `SKYDIO_API_TOKEN` | API Token from Skydio Cloud: Settings > API Tokens. Needs read access to Vehicles, Flights, Flight Telemetry, Live Telemetry & read/write access to Webhooks. Live Telemetry is a scope of its own - a token with Flight Telemetry can list vehicles and pull completed flight tracks but will still be rejected by the Live Telemetry websocket. Scopes are fixed when the token is generated, so widening them means issuing a new token |
 | `SKYDIO_API_URL` | Skydio Cloud API base - default `https://api.skydio.com/api` |
-| `SKYDIO_STREAM_URL` | Live Telemetry websocket base - region specific, default `wss://stream.skydio.com` |
+| `SKYDIO_STREAM_URL` | Live Telemetry websocket base - region specific, default `wss://stream.skydio.com`. The RTSPS video host is derived from this, so the region only has to be set once |
+| `SKYDIO_API_TOKEN_ID` | API Token **ID**, not the secret - copyable at any time from Settings > API Tokens. RTSPS streams are digest authenticated, so the video URL is only playable when this is set. See the warning below |
+| `SKYDIO_VIDEO_STREAM` | Camera stream to attach to the vehicle CoT: `color`, `thermal`, or `none` (default `color`) |
 | `WEBHOOK_URL` | Public URL of this Layer's webhook endpoint (webhooks API Gateway base + `/<layer UUID>`). If set, the scheduled run registers it with Skydio Cloud automatically |
 | `WEBHOOK_VERIFY` | Validate the `Skydio-Verification` JWT on incoming requests (default `true`) |
 | `STREAM_DURATION` | Max seconds of Live Telemetry streaming per scheduled run (default `55`) |
@@ -46,6 +48,50 @@ Incoming webhook requests are authenticated by validating the `Skydio-Verificati
 | `IMPORT_FLIGHT_TRACK` | Submit completed flight tracks as LineStrings (default `false`) |
 
 In Skydio Cloud, Live Telemetry must be enabled: Settings > Live Streaming > Live APIs > Live Telemetry.
+Video additionally requires RTSP Streaming to be toggled on in the same place, and the token to hold
+read-only access to Live Streaming - a third scope, separate from both Live Telemetry and Flight
+Telemetry.
+
+## Video
+
+Vehicle CoTs carry a `__video` detail so the drone's camera can be opened directly from the map. The
+detail is built against [node-cot](https://github.com/dfpc-coe/node-cot)'s `VideoAttributes` and
+`VideoConnectionEntryAttributes` schemas:
+
+```xml
+<__video uid="skydio-SkydioX10-xxxx" sensor="<callsign>-color" url="rtsps://...">
+  <ConnectionEntry uid="skydio-SkydioX10-xxxx" address="rtsps://..." alias="<callsign>"
+    protocol="raw" path="" port="-1" roverPort="-1" networkTimeout="12000"
+    bufferTime="-1" rtspReliable="0" ignoreEmbeddedKLV="false"/>
+</__video>
+```
+
+`protocol="raw"` tells ATAK to use `address` as a complete URL rather than assembling one from
+address/port/path - this is node-cot's own `CoT.addVideo()` default and the only form that survives a
+URL carrying credentials.
+
+The URL comes from one of two places:
+
+1. The `rtsp_url` Skydio sends on the `live_stream_status_changed` webhook, which is authoritative
+   for the stream the pilot actually started. Preferred whenever it has been received.
+2. Otherwise the [documented URL structure](https://apidocs.skydio.com/reference/rtsp-streaming),
+   `rtsps://<host>/<serial>/<color|thermal>`, so video still works on Layers without webhooks wired
+   up. Only attached when the vehicle reports `is_live_streaming`.
+
+Skydio publishes **RTSPS only** - h264 over TCP/TLS on port 322, digest authenticated. There is no
+RTMP endpoint. An X10 exposes two streams (`color` and `thermal`) but a CoT carries a single video
+detail, so `SKYDIO_VIDEO_STREAM` selects which one.
+
+> ⚠️ Setting `SKYDIO_API_TOKEN_ID` embeds `<token_id>:<token_secret>` into the video URL, because
+> that is the only way Skydio's digest auth can be satisfied by a TAK client. That URL is broadcast
+> in the CoT to every client subscribed to the Layer's channels, and ATAK persists it in its video
+> library. Anyone who receives the CoT holds a working API token for the organization. Leave
+> `SKYDIO_API_TOKEN_ID` unset to publish the URL without credentials - the stream will not play
+> unaided, but nothing is leaked. For a wider audience, front the stream with a CloudTAK video lease
+> instead, as `etl-verkada` does.
+
+A public demo stream needs no token and is useful for checking playback:
+`rtsps://stream.skydio.com/demo/Skydio/color` (and `/thermal`).
 
 ## Development
 

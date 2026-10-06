@@ -22,6 +22,14 @@ const InputSchema = Type.Object({
         default: 'wss://stream.skydio.com',
         description: 'Skydio Live Telemetry Websocket Base URL - Region specific, shown in Skydio Cloud: Settings > Devices > Vehicles > Connectivity'
     }),
+    'SKYDIO_API_TOKEN_ID': Type.Optional(Type.String({
+        description: 'Skydio API Token ID - distinct from the token secret and copyable at any time from Settings > API Tokens. Skydio RTSPS streams are digest authenticated, so without this the video URL attached to the CoT cannot be played'
+    })),
+    'SKYDIO_VIDEO_STREAM': Type.String({
+        default: 'color',
+        enum: ['color', 'thermal', 'none'],
+        description: 'Which camera stream to attach to the vehicle CoT - X10s publish both a color and a thermal stream, and a CoT carries a single video detail. Set to none to omit video entirely'
+    }),
     'WEBHOOK_URL': Type.Optional(Type.String({
         description: 'Public HTTPS URL of this Layer\'s Webhook endpoint. If set, the scheduled run will automatically register it with Skydio Cloud'
     })),
@@ -229,7 +237,64 @@ function handshake(url: URL): Promise<string> {
     });
 }
 
+type VideoDetail = NonNullable<Static<typeof Feature.InputFeature>['properties']['video']>;
+
+/**
+ * Derive the RTSPS URL Skydio serves for a vehicle
+ *
+ * https://apidocs.skydio.com/reference/rtsp-streaming
+ *
+ * Streams are h264 over RTSPS (TCP/TLS) on port 322 and are protected by digest auth
+ * using the API Token ID as the user and the API Token Secret as the password, so the
+ * credentials have to be embedded for a TAK client to be able to play the URL
+ *
+ *     rtsps://<api_token_id>:<api_token_secret>@stream.skydio.com/<serial>/<stream_name>
+ *
+ * The RTSPS host matches the Live Telemetry host, which is region specific
+ */
+function streamUrl(env: Static<typeof InputSchema>, serial: string): string {
+    // Assembled by hand rather than by mutating a URL - assigning `protocol` to swap a
+    // special scheme (wss) for a non-special one (rtsps) is silently ignored per WHATWG
+    const host = new URL(env.SKYDIO_STREAM_URL).host;
+
+    const auth = env.SKYDIO_API_TOKEN_ID
+        ? `${encodeURIComponent(env.SKYDIO_API_TOKEN_ID)}:${encodeURIComponent(env.SKYDIO_API_TOKEN)}@`
+        : '';
+
+    return `rtsps://${auth}${host}/${serial}/${env.SKYDIO_VIDEO_STREAM}`;
+}
+
+/**
+ * Build the CoT `__video` detail - `VideoAttributes` describes the stream and the
+ * `ConnectionEntry` is what ATAK persists in its video library
+ *
+ * `protocol: raw` tells ATAK to treat `address` as a complete URL rather than assembling
+ * one from address/port/path, which is what node-cot's own `CoT.addVideo()` defaults to
+ * and is the only form that survives a URL carrying credentials and a non-standard port
+ */
+function videoDetail(uid: string, callsign: string, url: string, stream_type: string): VideoDetail {
+    return {
+        uid,
+        sensor: `${callsign}-${stream_type}`,
+        url,
+        connection: {
+            uid,
+            address: url,
+            alias: callsign,
+            protocol: 'raw',
+            path: '',
+            port: -1,
+            roverPort: -1,
+            networkTimeout: 12000,
+            bufferTime: -1,
+            rtspReliable: 0,
+            ignoreEmbeddedKLV: false
+        }
+    };
+}
+
 function statusToFeature(
+    env: Static<typeof InputSchema>,
     status: Static<typeof LiveStatus>,
     opts: {
         vehicle?: Static<typeof SkydioVehicle>,
@@ -289,25 +354,25 @@ function statusToFeature(
         };
     }
 
-    if (opts.stream) {
-        feat.properties.video = {
-            uid: `skydio-${status.serial}`,
-            sensor: `${callsign}-${opts.stream.stream_type}`,
-            url: opts.stream.rtsp_url,
-            connection: {
-                uid: `skydio-${status.serial}`,
-                networkTimeout: 12000,
-                path: '',
-                protocol: 'raw',
-                bufferTime: -1,
-                address: opts.stream.rtsp_url,
-                port: -1,
-                roverPort: -1,
-                rtspReliable: 0,
-                ignoreEmbeddedKLV: false,
-                alias: callsign
-            }
-        };
+    // Prefer the URL Skydio handed us on the live_stream_status_changed webhook - it is
+    // authoritative for the stream the pilot actually started. Otherwise fall back to the
+    // documented URL structure so video still works on layers without webhooks wired up
+    if (env.SKYDIO_VIDEO_STREAM !== 'none') {
+        if (opts.stream) {
+            feat.properties.video = videoDetail(
+                `skydio-${status.serial}`,
+                callsign,
+                opts.stream.rtsp_url,
+                opts.stream.stream_type
+            );
+        } else if (opts.vehicle?.is_live_streaming) {
+            feat.properties.video = videoDetail(
+                `skydio-${status.serial}`,
+                callsign,
+                streamUrl(env, status.serial),
+                env.SKYDIO_VIDEO_STREAM
+            );
+        }
     }
 
     return feat;
@@ -476,7 +541,7 @@ export default class Task extends ETL {
                 const fc: Static<typeof Feature.InputFeatureCollection> = {
                     type: 'FeatureCollection',
                     features: Array.from(latest.values()).map((status) => {
-                        return statusToFeature(status, {
+                        return statusToFeature(env, status, {
                             vehicle: byserial.get(status.serial),
                             stream: streams[status.serial]
                         });
