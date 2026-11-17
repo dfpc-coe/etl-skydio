@@ -227,8 +227,12 @@ function handshake(url: URL): Promise<string> {
 
         req.on('response', (res) => {
             let body = '';
-            res.on('data', (chunk) => body += String(chunk));
-            res.on('end', () => resolve(`${res.statusCode} ${body.trim()}`));
+            res.on('data', (chunk) => {
+                body += String(chunk);
+            });
+            res.on('end', () => {
+                resolve(`${res.statusCode} ${body.trim()}`);
+            });
         });
 
         req.on('error', reject);
@@ -394,15 +398,9 @@ export default class Task extends ETL {
         type: SchemaType = SchemaType.Input,
         flow: DataFlowType = DataFlowType.Incoming
     ): Promise<TSchema> {
-        if (flow === DataFlowType.Incoming) {
-            if (type === SchemaType.Input) {
-                return InputSchema;
-            } else {
-                return OutputSchema;
-            }
-        } else {
-            return Type.Object({});
-        }
+        if (flow !== DataFlowType.Incoming) return Type.Object({});
+
+        return type === SchemaType.Input ? InputSchema : OutputSchema;
     }
 
     /**
@@ -441,11 +439,11 @@ export default class Task extends ETL {
 
         // All Skydio responses use a standard { data, meta, status_code, ... } envelope
         const envelope: unknown = await res.json();
-        if (!envelope || typeof envelope !== 'object' || !('data' in envelope)) {
+        if (typeof envelope !== 'object' || envelope === null || !('data' in envelope)) {
             throw new Error(`Skydio API ${opts.method || 'GET'} ${path} returned an unexpected response envelope`);
         }
 
-        return this.type(schema, (envelope as { data: unknown }).data);
+        return this.type(schema, envelope.data);
     }
 
     /**
@@ -462,7 +460,7 @@ export default class Task extends ETL {
             webhooks: Type.Optional(Type.Array(SkydioWebhook))
         }, { additionalProperties: true }));
 
-        const existing = (list.webhooks || []).find((hook) => hook.url === env.WEBHOOK_URL);
+        const existing = (list.webhooks ?? []).find((hook) => hook.url === env.WEBHOOK_URL);
 
         if (existing) {
             if (eph.webhook_id !== existing.id || eph.webhook_url !== existing.url) {
@@ -499,7 +497,7 @@ export default class Task extends ETL {
                 vehicles: Type.Optional(Type.Array(SkydioVehicle))
             }, { additionalProperties: true }));
 
-            vehicles.push(...(data.vehicles || []));
+            vehicles.push(...(data.vehicles ?? []));
             total_pages = data.pagination.total_pages;
             ++page;
         } while (page <= total_pages);
@@ -520,7 +518,7 @@ export default class Task extends ETL {
     ): Promise<void> {
         const byserial = new Map(vehicles.map((vehicle) => [vehicle.vehicle_serial, vehicle]));
         const eph = await this.ephemeral(EphemeralSchema);
-        const streams = eph.streams || {};
+        const streams = eph.streams ?? {};
 
         const url = new URL('/data', env.SKYDIO_STREAM_URL);
         url.searchParams.set('skydioSerials', Array.from(byserial.keys()).join(','));
@@ -573,24 +571,19 @@ export default class Task extends ETL {
              * close - replay the handshake over plain HTTPS to recover the status code
              * and body Skydio actually returned
              */
-            const diagnose = (): Promise<void> => {
-                if (!diagnosing) {
-                    diagnosing = handshake(url)
-                        .then((res) => {
-                            console.error(`not ok - live telemetry websocket failed: ${res}`);
+            const diagnose = async (): Promise<void> => {
+                try {
+                    const res = await handshake(url);
+                    console.error(`not ok - live telemetry websocket failed: ${res}`);
 
-                            // Every documented auth form produces the same 401, so this is never
-                            // something the request shape can fix - it is the token or the region
-                            if (res.startsWith('401')) {
-                                console.error('not ok - check that the API Token has read-only access to Live Telemetry (Settings > API Tokens - scopes are fixed at creation, so this needs a new token), that Live Telemetry is enabled (Settings > Live Streaming > Live APIs), and that SKYDIO_STREAM_URL matches the region shown under Settings > Devices > Vehicles > Connectivity');
-                            }
-                        })
-                        .catch((err) => {
-                            console.error('not ok - live telemetry websocket failed', err instanceof Error ? err.message : err);
-                        });
+                    // Every documented auth form produces the same 401, so this is never
+                    // something the request shape can fix - it is the token or the region
+                    if (res.startsWith('401')) {
+                        console.error('not ok - check that the API Token has read-only access to Live Telemetry (Settings > API Tokens - scopes are fixed at creation, so this needs a new token), that Live Telemetry is enabled (Settings > Live Streaming > Live APIs), and that SKYDIO_STREAM_URL matches the region shown under Settings > Devices > Vehicles > Connectivity');
+                    }
+                } catch (err) {
+                    console.error('not ok - live telemetry websocket failed', err instanceof Error ? err.message : err);
                 }
-
-                return diagnosing;
             };
 
             const finish = (): void => {
@@ -608,14 +601,17 @@ export default class Task extends ETL {
 
                 // Never opened - report why before giving the stream budget back
                 if (!opened) {
-                    diagnose().finally(resolve);
+                    diagnosing ??= diagnose();
+                    void diagnosing.finally(resolve);
                 } else {
                     resolve();
                 }
             };
 
             deadline = setTimeout(finish, duration);
-            interval = setInterval(flush, env.SUBMIT_INTERVAL * 1000);
+            interval = setInterval(() => {
+                void flush();
+            }, env.SUBMIT_INTERVAL * 1000);
 
             ws.addEventListener('open', () => {
                 opened = true;
@@ -671,7 +667,9 @@ export default class Task extends ETL {
         }, { additionalProperties: true }));
 
         const positions = data.flight_telemetry.aligned_telemetry
-            .filter((entry) => entry.gps_latitude !== undefined && entry.gps_longitude !== undefined);
+            .filter((entry): entry is typeof entry & { gps_latitude: number; gps_longitude: number } => {
+                return entry.gps_latitude !== undefined && entry.gps_longitude !== undefined;
+            });
 
         if (positions.length < 2) {
             console.log(`ok - flight ${flight_id} has insufficient GPS telemetry for a track`);
@@ -682,7 +680,7 @@ export default class Task extends ETL {
         const step = Math.max(1, Math.ceil(positions.length / 1000));
         const coordinates = positions
             .filter((_, idx) => idx % step === 0 || idx === positions.length - 1)
-            .map((entry) => [entry.gps_longitude!, entry.gps_latitude!, entry.gps_altitude ?? 0]);
+            .map((entry) => [entry.gps_longitude, entry.gps_latitude, entry.gps_altitude ?? 0]);
 
         const fc: Static<typeof Feature.InputFeatureCollection> = {
             type: 'FeatureCollection',
@@ -692,7 +690,7 @@ export default class Task extends ETL {
                 properties: {
                     type: 'u-d-f',
                     callsign: `${vehicle_serial || 'Skydio'} Flight Track`,
-                    remarks: `Flight: ${flight_id}\nVehicle: ${vehicle_serial || 'Unknown'}\nStart: ${positions[0].timestamp}\nEnd: ${positions[positions.length - 1].timestamp}`,
+                    remarks: `Flight: ${flight_id}\nVehicle: ${vehicle_serial || 'Unknown'}\nStart: ${positions[0].timestamp}\nEnd: ${positions.at(-1)?.timestamp ?? ''}`,
                     stroke: '#00E0E0',
                     'stroke-width': 3,
                     'stroke-opacity': 1
@@ -714,7 +712,7 @@ export default class Task extends ETL {
      * https://apidocs.skydio.com/reference/webhook-validation
      */
     async verify(env: Static<typeof InputSchema>, token: unknown, body: unknown): Promise<void> {
-        if (!token || typeof token !== 'string') throw new Error('Missing Skydio-Verification header');
+        if (typeof token !== 'string' || !token) throw new Error('Missing Skydio-Verification header');
 
         const parts = token.split('.');
         if (parts.length !== 3) throw new Error('Malformed Skydio-Verification JWT');
@@ -767,7 +765,8 @@ export default class Task extends ETL {
      * https://apidocs.skydio.com/reference/webhook_request_format
      */
     static webhooks = async function(schema: Schema, base: ETL): Promise<void> {
-        const task = base as Task;
+        if (!(base instanceof Task)) throw new TypeError('Webhooks require a Task instance');
+        const task = base;
 
         await schema.get('/:webhookid', {
             name: 'Webhook Healthcheck',
@@ -790,78 +789,80 @@ export default class Task extends ETL {
                 status: Type.Integer(),
                 message: Type.String()
             })
-        }, async (req, res) => {
-            try {
-                const env = await task.env(InputSchema);
-
-                if (env.WEBHOOK_VERIFY) {
-                    await task.verify(env, req.headers['skydio-verification'], req.body);
-                }
-
-                const event = task.type(WebhookEvent, req.body);
-                const resource = event.data.resource;
-
-                if (env.DEBUG) console.log(JSON.stringify(event));
-
-                if (event.event_type === 'skydio.cloud.event.flight_state') {
-                    const flight = task.type(FlightStateResource, resource);
-
-                    await task.alert({
-                        icon: flight.type === 'FLIGHT_START' ? 'plane-departure' : 'plane-arrival',
-                        title: `Skydio ${flight.vehicle_serial}: ${flight.type === 'FLIGHT_START' ? 'Flight Started' : 'Flight Ended'}`,
-                        description: `Flight ${flight.flight_id || 'Unknown'} at ${flight.time || event.event_time || 'Unknown Time'}`
+        }, (req, res) => {
+            task.receive(req.headers['skydio-verification'], req.body)
+                .then(() => res.json({ status: 200, message: 'Webhook Processed' }))
+                .catch((err: unknown) => {
+                    console.error(err);
+                    res.status(400).json({
+                        status: 400,
+                        message: err instanceof Error ? err.message : String(err)
                     });
-                } else if (event.event_type === 'skydio.cloud.event.device_alert') {
-                    const alert = task.type(DeviceAlertResource, resource);
-
-                    const detail = [];
-                    if (alert.mission_result) detail.push(`Mission Result: ${alert.mission_result}`);
-                    if (alert.dock_error_type) detail.push(`Dock Error: ${alert.dock_error_type}`);
-
-                    await task.alert({
-                        icon: 'alert-triangle',
-                        priority: alert.alert_type === 'HUMAN_DETECTED' ? 'red' : 'yellow',
-                        title: `Skydio ${alert.device?.id || 'Unknown Device'}: ${alert.alert_type.replace(/_/g, ' ')}`,
-                        description: detail.length ? detail.join('\n') : `At ${alert.alert_time || event.event_time || 'Unknown Time'}`
-                    });
-                } else if (event.event_type === 'skydio.cloud.event.online_status') {
-                    const status = task.type(OnlineStatusResource, resource);
-                    console.log(`ok - ${status.device?.id || 'Unknown Device'} is now ${status.is_online ? 'online' : 'offline'}`);
-                } else if (event.event_type === 'skydio.cloud.event.live_stream_status_changed') {
-                    const stream = task.type(LiveStreamResource, resource);
-
-                    const eph = await task.ephemeral(EphemeralSchema);
-                    const streams = { ...(eph.streams || {}) };
-
-                    if (stream.live_stream_status === 'LIVE_STREAM_START' && stream.rtsp_url) {
-                        streams[stream.vehicle_serial] = {
-                            rtsp_url: stream.rtsp_url,
-                            stream_type: stream.stream_type || 'color'
-                        };
-                    } else if (stream.live_stream_status === 'LIVE_STREAM_END') {
-                        delete streams[stream.vehicle_serial];
-                    }
-
-                    await task.setEphemeral({ ...eph, streams });
-                } else if (event.event_type === 'skydio.cloud.event.telemetry_available') {
-                    const telemetry = task.type(TelemetryAvailableResource, resource);
-
-                    if (env.IMPORT_FLIGHT_TRACK) {
-                        await task.importFlightTrack(env, telemetry.flight_id, telemetry.vehicle_serial);
-                    }
-                } else {
-                    console.log(`ok - ignoring unhandled event type: ${event.event_type}`);
-                }
-
-                res.json({ status: 200, message: 'Webhook Processed' });
-            } catch (err) {
-                console.error(err);
-                res.status(400).json({
-                    status: 400,
-                    message: err instanceof Error ? err.message : String(err)
                 });
-            }
         });
+    }
+
+    async receive(token: unknown, body: unknown): Promise<void> {
+        const env = await this.env(InputSchema);
+
+        if (env.WEBHOOK_VERIFY) {
+            await this.verify(env, token, body);
+        }
+
+        const event = this.type(WebhookEvent, body);
+        const resource = event.data.resource;
+
+        if (env.DEBUG) console.log(JSON.stringify(event));
+
+        if (event.event_type === 'skydio.cloud.event.flight_state') {
+            const flight = this.type(FlightStateResource, resource);
+
+            await this.alert({
+                icon: flight.type === 'FLIGHT_START' ? 'plane-departure' : 'plane-arrival',
+                title: `Skydio ${flight.vehicle_serial}: ${flight.type === 'FLIGHT_START' ? 'Flight Started' : 'Flight Ended'}`,
+                description: `Flight ${flight.flight_id || 'Unknown'} at ${flight.time || event.event_time || 'Unknown Time'}`
+            });
+        } else if (event.event_type === 'skydio.cloud.event.device_alert') {
+            const alert = this.type(DeviceAlertResource, resource);
+
+            const detail = [];
+            if (alert.mission_result) detail.push(`Mission Result: ${alert.mission_result}`);
+            if (alert.dock_error_type) detail.push(`Dock Error: ${alert.dock_error_type}`);
+
+            await this.alert({
+                icon: 'alert-triangle',
+                priority: alert.alert_type === 'HUMAN_DETECTED' ? 'red' : 'yellow',
+                title: `Skydio ${alert.device?.id || 'Unknown Device'}: ${alert.alert_type.replaceAll('_', ' ')}`,
+                description: detail.length > 0 ? detail.join('\n') : `At ${alert.alert_time || event.event_time || 'Unknown Time'}`
+            });
+        } else if (event.event_type === 'skydio.cloud.event.online_status') {
+            const status = this.type(OnlineStatusResource, resource);
+            console.log(`ok - ${status.device?.id || 'Unknown Device'} is now ${status.is_online ? 'online' : 'offline'}`);
+        } else if (event.event_type === 'skydio.cloud.event.live_stream_status_changed') {
+            const stream = this.type(LiveStreamResource, resource);
+
+            const eph = await this.ephemeral(EphemeralSchema);
+            const streams = { ...eph.streams };
+
+            if (stream.live_stream_status === 'LIVE_STREAM_START' && stream.rtsp_url) {
+                streams[stream.vehicle_serial] = {
+                    rtsp_url: stream.rtsp_url,
+                    stream_type: stream.stream_type || 'color'
+                };
+            } else if (stream.live_stream_status === 'LIVE_STREAM_END') {
+                delete streams[stream.vehicle_serial];
+            }
+
+            await this.setEphemeral({ ...eph, streams });
+        } else if (event.event_type === 'skydio.cloud.event.telemetry_available') {
+            const telemetry = this.type(TelemetryAvailableResource, resource);
+
+            if (env.IMPORT_FLIGHT_TRACK) {
+                await this.importFlightTrack(env, telemetry.flight_id, telemetry.vehicle_serial);
+            }
+        } else {
+            console.log(`ok - ignoring unhandled event type: ${event.event_type}`);
+        }
     }
 
     /**
@@ -886,7 +887,7 @@ export default class Task extends ETL {
             return ['FLYING', 'PREP'].includes(vehicle.flight_status || '') || vehicle.is_live_streaming;
         });
 
-        if (!active.length) {
+        if (active.length === 0) {
             console.log('ok - no vehicles currently in flight');
             return;
         }
@@ -899,6 +900,6 @@ export default class Task extends ETL {
 }
 
 await local(await Task.init(import.meta.url), import.meta.url);
-export async function handler(event: Event = {}) {
-    return await internal(new Task(import.meta.url), event);
+export async function handler(event: Event = {}): ReturnType<typeof internal> {
+    return internal(new Task(import.meta.url), event);
 }
